@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import time
 import warnings
 from typing import Optional, Tuple
 
@@ -22,6 +23,7 @@ _model = None
 _processor = None
 _watermark = None
 _current_model_id = None  # Track which model is loaded
+_quantization = "4bit"  # Set by launch_app()
 
 
 def get_device():
@@ -38,6 +40,18 @@ def _get_available_voices():
     global _processor
     if _processor is not None:
         return _processor.get_available_voices()
+
+    # Model is lazy loaded, so read the registry shipped in the repo for the initial dropdown
+    import json
+    from pathlib import Path
+
+    for parent in Path(__file__).resolve().parents:
+        registry = parent / "voices" / "voices.json"
+        if registry.is_file():
+            try:
+                return list(json.loads(registry.read_text(encoding="utf-8")).keys())
+            except (OSError, ValueError):
+                return []
     return []
 
 
@@ -101,12 +115,10 @@ def load_models(model_id: str = "kugelaudio/kugelaudio-0-open"):
     """Load model and processor. Switches model if a different model_id is requested."""
     global _model, _processor, _watermark, _current_model_id
 
-    from kugelaudio_open.models import KugelAudioForConditionalGenerationInference
-    from kugelaudio_open.processors import KugelAudioProcessor
+    from kugelaudio_open.utils import load_model_and_processor
     from kugelaudio_open.watermark import AudioWatermark
 
     device = get_device()
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     # Check if we need to load a different model
     if _model is None or _current_model_id != model_id:
@@ -121,26 +133,12 @@ def load_models(model_id: str = "kugelaudio/kugelaudio-0-open"):
             if device == "cuda":
                 torch.cuda.empty_cache()
 
-        print(f"Loading model {model_id} on {device}...")
-        try:
-            _model = KugelAudioForConditionalGenerationInference.from_pretrained(
-                model_id,
-                torch_dtype=dtype,
-                attn_implementation="flash_attention_2" if device == "cuda" else "sdpa",
-            ).to(device)
-        except Exception:
-            _model = KugelAudioForConditionalGenerationInference.from_pretrained(
-                model_id,
-                torch_dtype=dtype,
-            ).to(device)
-        _model.eval()
-        # Strip encoder weights to free VRAM (only decoder needed for inference)
-        _model.model.strip_encoders()
+        print(f"Loading model {model_id} on {device} (quantization: {_quantization})...")
+        _model, _processor = load_model_and_processor(
+            model_id, device=device, quantization=_quantization
+        )
         _current_model_id = model_id
         print(f"Model {model_id} loaded!")
-
-    if _processor is None:
-        _processor = KugelAudioProcessor.from_pretrained(model_id)
 
     # Warmup to eliminate first-generation slowness from CUDA kernel compilation
     # Do this after processor is loaded so we can run a mini-generation
@@ -156,6 +154,27 @@ def load_models(model_id: str = "kugelaudio/kugelaudio-0-open"):
         _watermark = AudioWatermark(device=device)
 
     return _model, _processor, _watermark
+
+
+SAMPLE_RATE = 24000
+MAX_CHUNK_CHARS = 250
+
+
+def _split_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list:
+    """Split text into chunks of whole sentences, each at most ~max_chars long."""
+    import re
+
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
+    chunks, current = [], ""
+    for sentence in sentences:
+        if current and len(current) + 1 + len(sentence) > max_chars:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        chunks.append(current)
+    return chunks or [text]
 
 
 def generate_speech(
@@ -187,60 +206,74 @@ def generate_speech(
     model, processor, watermark = load_models(model_id)
     device = next(model.parameters()).device
 
-    # Process text input with optional pre-encoded voice
-    if voice_name and voice_name != "None":
-        inputs = processor(text=text.strip(), voice=voice_name, return_tensors="pt")
-    else:
-        inputs = processor(text=text.strip(), return_tensors="pt")
-
-    # Move tensors to device, keep dicts as-is
-    model_inputs = {}
-    for k, v in inputs.items():
-        if isinstance(v, torch.Tensor):
-            model_inputs[k] = v.to(device)
-        else:
-            model_inputs[k] = v
-
+    # The model tends to end early on long inputs, so synthesize sentence-sized chunks
+    chunks = _split_text(text.strip())
     print(
-        f"[Generation] Using model: {model_id}, voice={voice_name}, cfg_scale={cfg_scale}, max_tokens={max_tokens}"
+        f"[Generation] Using model: {model_id}, voice={voice_name}, cfg_scale={cfg_scale}, "
+        f"max_tokens={max_tokens}, chunks={len(chunks)}"
     )
 
-    # Generate
-    with torch.no_grad():
-        outputs = model.generate(
-            **model_inputs,
-            cfg_scale=cfg_scale,
-            max_new_tokens=max_tokens,
+    pause = np.zeros(int(SAMPLE_RATE * 0.25), dtype=np.float32)
+    pieces = []
+    total_tokens = 0
+    gen_start = time.perf_counter()
+    for i, chunk in enumerate(chunks):
+        if voice_name and voice_name != "None":
+            inputs = processor(text=chunk, voice=voice_name, return_tensors="pt")
+        else:
+            inputs = processor(text=chunk, return_tensors="pt")
+
+        # Move tensors to device, keep dicts as-is
+        model_inputs = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()
+        }
+
+        chunk_start = time.perf_counter()
+        with torch.no_grad():
+            outputs = model.generate(
+                **model_inputs,
+                cfg_scale=cfg_scale,
+                max_new_tokens=max_tokens,
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        chunk_time = time.perf_counter() - chunk_start
+        chunk_tokens = outputs.sequences.shape[1] - model_inputs["text_ids"].shape[1]
+        total_tokens += chunk_tokens
+
+        if not outputs.speech_outputs or outputs.speech_outputs[0] is None:
+            raise gr.Error(f"Generation failed on chunk {i + 1}/{len(chunks)}: {chunk[:60]!r}")
+
+        # Audio is already watermarked by the model's generate method
+        piece = outputs.speech_outputs[0]
+        if isinstance(piece, torch.Tensor):
+            # float32 first since numpy doesn't support bfloat16
+            piece = piece.cpu().float().numpy()
+        piece = piece.squeeze()
+        print(
+            f"[Generation] Chunk {i + 1}/{len(chunks)}: {len(piece) / SAMPLE_RATE:.2f}s audio, "
+            f"{chunk_tokens} tokens in {chunk_time:.2f}s ({chunk_tokens / chunk_time:.2f} tok/s)"
         )
+        if pieces:
+            pieces.append(pause)
+        pieces.append(piece.astype(np.float32))
 
-    if not outputs.speech_outputs or outputs.speech_outputs[0] is None:
-        raise gr.Error("Generation failed. Please try again with different settings.")
-
-    # Audio is already watermarked by the model's generate method
-    audio = outputs.speech_outputs[0]
-    print(f"[Generation] Raw output: shape={audio.shape}, dtype={audio.dtype}")
-
-    # Convert to numpy (convert to float32 first since numpy doesn't support bfloat16)
-    if isinstance(audio, torch.Tensor):
-        audio = audio.cpu().float().numpy()
-
-    # Ensure correct shape (1D array)
-    audio = audio.squeeze()
+    gen_time = time.perf_counter() - gen_start
+    audio = np.concatenate(pieces)
 
     # Normalize to prevent clipping (important for Gradio playback)
     max_val = np.abs(audio).max()
     if max_val > 1.0:
         audio = audio / max_val * 0.95
 
+    print(f"[Generation] Final output: shape={audio.shape}, duration={len(audio)/SAMPLE_RATE:.2f}s")
     print(
-        f"[Generation] Final output: shape={audio.shape}, dtype={audio.dtype}, duration={len(audio)/24000:.2f}s"
-    )
-    print(
-        f"[Generation] Audio stats: min={audio.min():.4f}, max={audio.max():.4f}, std={audio.std():.4f}"
+        f"[Generation] Total: {gen_time:.2f}s, {total_tokens} tokens, "
+        f"avg {total_tokens / gen_time:.2f} tok/s, RTF {gen_time / (len(audio) / SAMPLE_RATE):.2f}x"
     )
 
     # Return with explicit sample rate - Gradio expects (sample_rate, audio_array)
-    return (24000, audio)
+    return (SAMPLE_RATE, audio)
 
 
 def check_watermark(audio: Tuple[int, np.ndarray]) -> str:
@@ -455,6 +488,7 @@ def launch_app(
     share: bool = False,
     server_name: str = "127.0.0.1",
     server_port: int = 7860,
+    quantization: str = "4bit",
     **kwargs,
 ):
     """Launch the Gradio web interface.
@@ -463,8 +497,11 @@ def launch_app(
         share: Create a public share link
         server_name: Server hostname (use "0.0.0.0" for network access)
         server_port: Server port
+        quantization: Language model weight quantization ("4bit", "8bit" or "none")
         **kwargs: Additional arguments passed to gr.Blocks.launch()
     """
+    global _quantization
+    _quantization = quantization
     app = create_app()
     app.launch(
         share=share,

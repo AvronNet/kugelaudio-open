@@ -4,6 +4,8 @@
 import argparse
 import sys
 
+from kugelaudio_open.utils.generation import DEFAULT_QUANTIZATION, QUANTIZATION_CHOICES
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -35,6 +37,12 @@ Examples:
     ui_parser.add_argument("--share", action="store_true", help="Create public share link")
     ui_parser.add_argument("--host", default="127.0.0.1", help="Server hostname")
     ui_parser.add_argument("--port", type=int, default=7860, help="Server port")
+    ui_parser.add_argument(
+        "--quantize",
+        choices=QUANTIZATION_CHOICES,
+        default=DEFAULT_QUANTIZATION,
+        help="Weight quantization for the language model (needs CUDA)",
+    )
 
     # Generate command
     gen_parser = subparsers.add_parser("generate", help="Generate speech from text")
@@ -45,6 +53,12 @@ Examples:
     )
     gen_parser.add_argument("--model", default="kugelaudio/kugelaudio-0-open", help="Model ID")
     gen_parser.add_argument("--cfg-scale", type=float, default=3.0, help="Guidance scale")
+    gen_parser.add_argument(
+        "--quantize",
+        choices=QUANTIZATION_CHOICES,
+        default=DEFAULT_QUANTIZATION,
+        help="Weight quantization for the language model (needs CUDA)",
+    )
 
     # Verify command
     verify_parser = subparsers.add_parser("verify", help="Check watermark in audio")
@@ -59,27 +73,20 @@ Examples:
             share=args.share,
             server_name=args.host,
             server_port=args.port,
+            quantization=args.quantize,
         )
 
     elif args.command == "generate":
         import torch
 
-        from kugelaudio_open.models import KugelAudioForConditionalGenerationInference
-        from kugelaudio_open.processors import KugelAudioProcessor
+        from kugelaudio_open.utils import load_model_and_processor
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-        print(f"Loading model {args.model}...")
-        model = KugelAudioForConditionalGenerationInference.from_pretrained(
-            args.model, torch_dtype=dtype
-        ).to(device)
-        model.eval()
-
-        processor = KugelAudioProcessor.from_pretrained(args.model)
-
-        # Strip encoders to save VRAM (only decoders needed for inference)
-        model.model.strip_encoders()
+        print(f"Loading model {args.model} ({args.quantize}) on {device}...")
+        model, processor = load_model_and_processor(
+            args.model, device=device, quantization=args.quantize
+        )
 
         # Process inputs with optional pre-encoded voice
         inputs = processor(text=args.text, voice=args.voice, return_tensors="pt")

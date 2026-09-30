@@ -23,6 +23,8 @@ Usage:
 import argparse
 import sys
 
+from kugelaudio_open.utils.generation import DEFAULT_QUANTIZATION, QUANTIZATION_CHOICES
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -54,6 +56,8 @@ Examples:
     ui_parser.add_argument("--host", default="127.0.0.1", help="Server hostname (use 0.0.0.0 for network access)")
     ui_parser.add_argument("--port", type=int, default=7860, help="Server port")
     ui_parser.add_argument("--model", default="kugelaudio/kugelaudio-0-open", help="Default model to load")
+    ui_parser.add_argument("--quantize", choices=QUANTIZATION_CHOICES, default=DEFAULT_QUANTIZATION,
+                           help="Weight quantization for the language model (needs CUDA)")
 
     # Generate command
     gen_parser = subparsers.add_parser("generate", help="Generate speech from text")
@@ -63,6 +67,8 @@ Examples:
     gen_parser.add_argument("--model", default="kugelaudio/kugelaudio-0-open", help="Model ID")
     gen_parser.add_argument("--cfg-scale", type=float, default=3.0, help="Guidance scale (1.0-10.0)")
     gen_parser.add_argument("--max-tokens", type=int, default=4096, help="Maximum generation tokens")
+    gen_parser.add_argument("--quantize", choices=QUANTIZATION_CHOICES, default=DEFAULT_QUANTIZATION,
+                            help="Weight quantization for the language model (needs CUDA)")
 
     # Verify command
     verify_parser = subparsers.add_parser("verify", help="Check watermark in audio")
@@ -77,12 +83,14 @@ Examples:
         args.host = "127.0.0.1"
         args.port = 7860
         args.model = "kugelaudio/kugelaudio-0-open"
+        args.quantize = DEFAULT_QUANTIZATION
 
     if args.command == "ui":
         print("🎙️ Starting KugelAudio Web Interface...")
         print(f"   Host: {args.host}")
         print(f"   Port: {args.port}")
         print(f"   Share: {args.share}")
+        print(f"   Quantization: {args.quantize}")
         print()
         
         from kugelaudio_open.ui import launch_app
@@ -90,30 +98,27 @@ Examples:
             share=args.share,
             server_name=args.host,
             server_port=args.port,
+            quantization=args.quantize,
         )
 
     elif args.command == "generate":
         import torch
-        from kugelaudio_open.models import KugelAudioForConditionalGenerationInference
-        from kugelaudio_open.processors import KugelAudioProcessor
+        from kugelaudio_open.utils import load_model_and_processor
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
         print(f"🎙️ KugelAudio Speech Generation")
         print(f"   Model: {args.model}")
         print(f"   Device: {device}")
+        print(f"   Quantization: {args.quantize}")
         print(f"   Text: {args.text[:50]}..." if len(args.text) > 50 else f"   Text: {args.text}")
         print(f"   Voice: {args.voice}")
         print()
 
         print("Loading model...")
-        model = KugelAudioForConditionalGenerationInference.from_pretrained(
-            args.model, torch_dtype=dtype
-        ).to(device)
-        model.eval()
-
-        processor = KugelAudioProcessor.from_pretrained(args.model)
+        model, processor = load_model_and_processor(
+            args.model, device=device, quantization=args.quantize
+        )
 
         # Process inputs
         inputs = processor(

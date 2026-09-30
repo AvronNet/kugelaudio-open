@@ -15,6 +15,14 @@ Example:
     >>> inputs = processor(text="Hello world!", voice="default", return_tensors="pt")
 """
 
+import os
+import sys
+
+# AudioSeal torch.compiles its watermark generator; Inductor needs an MSVC toolchain
+# on Windows, which most machines don't have. Must be set before audioseal is imported.
+if sys.platform == "win32":
+    os.environ.setdefault("NO_TORCH_COMPILE", "1")
+
 __version__ = "0.1.0"
 
 from .configs import (

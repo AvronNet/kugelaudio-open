@@ -3,6 +3,7 @@
 import argparse
 
 from kugelaudio_open.ui import launch_app
+from kugelaudio_open.utils.generation import DEFAULT_QUANTIZATION, QUANTIZATION_CHOICES
 
 
 def main():
@@ -23,6 +24,12 @@ def main():
         default=7860,
         help="Server port (default: 7860)",
     )
+    parser.add_argument(
+        "--quantize",
+        choices=QUANTIZATION_CHOICES,
+        default=DEFAULT_QUANTIZATION,
+        help=f"Language model weight quantization, needs CUDA (default: {DEFAULT_QUANTIZATION})",
+    )
     
     args = parser.parse_args()
     
@@ -34,6 +41,7 @@ def main():
         share=args.share,
         server_name=args.host,
         server_port=args.port,
+        quantization=args.quantize,
     )
 
 

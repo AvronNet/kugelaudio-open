@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import modeling_utils
 from transformers.cache_utils import DynamicCache
@@ -72,6 +73,27 @@ class KugelAudioTokenConstraintProcessor(LogitsProcessor):
         return scores
 
 
+class _RestrictedLMHead(nn.Module):
+    """LM head that only computes logits for a fixed set of token ids.
+
+    Every other position is filled with -inf, which is exactly what
+    KugelAudioTokenConstraintProcessor does to the full-vocabulary logits during
+    generation, so sampling is unchanged while the 152k-row weight matrix is freed.
+    """
+
+    def __init__(self, weight: torch.Tensor, token_ids: List[int], vocab_size: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.register_buffer("token_ids", torch.tensor(token_ids, dtype=torch.long, device=weight.device))
+        self.weight = nn.Parameter(weight[self.token_ids].clone(), requires_grad=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        selected = F.linear(hidden_states, self.weight)
+        logits = selected.new_full((*hidden_states.shape[:-1], self.vocab_size), float("-inf"))
+        logits[..., self.token_ids] = selected
+        return logits
+
+
 class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, GenerationMixin):
     """KugelAudio model for inference with speech generation capabilities."""
 
@@ -124,6 +146,29 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def _generation_token_ids(self) -> Tuple[int, int, int, int]:
+        """Token ids generate() may emit: speech start, speech end, speech diffusion, EOS."""
+        speech_start_id = getattr(self.config, "speech_start_id", None) or 151652
+        speech_end_id = getattr(self.config, "speech_end_id", None) or 151653
+        speech_diffusion_id = getattr(self.config, "speech_diffusion_id", None) or 151654
+        eos_token_id = getattr(self.config.decoder_config, "eos_token_id", None) or 151643
+        return speech_start_id, speech_end_id, speech_diffusion_id, eos_token_id
+
+    def restrict_lm_head(self):
+        """Shrink the LM head to the few tokens generate() can emit, freeing ~1 GB of VRAM.
+
+        Inference-only: afterwards lm_head returns -inf for every other token id.
+        """
+        if isinstance(self.lm_head, _RestrictedLMHead):
+            return
+        self.lm_head = _RestrictedLMHead(
+            self.lm_head.weight.data,
+            list(self._generation_token_ids()),
+            self.config.decoder_config.vocab_size,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def set_ddpm_inference_steps(self, num_steps=None):
         self.ddpm_inference_steps = (
@@ -318,10 +363,9 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
         batch_size = text_ids.shape[0]
 
         # Get special token IDs
-        speech_start_id = getattr(self.config, "speech_start_id", None) or 151652
-        speech_end_id = getattr(self.config, "speech_end_id", None) or 151653
-        speech_diffusion_id = getattr(self.config, "speech_diffusion_id", None) or 151654
-        eos_token_id = getattr(self.config.decoder_config, "eos_token_id", None) or 151643
+        speech_start_id, speech_end_id, speech_diffusion_id, eos_token_id = (
+            self._generation_token_ids()
+        )
 
         # Initialize streaming cache for acoustic tokenizer only
         acoustic_cache_streaming = KugelAudioTokenizerStreamingCache()
@@ -380,6 +424,7 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
                     use_cache=True,
+                    logits_to_keep=1,
                     return_dict=True,
                 )
             else:
@@ -388,6 +433,7 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     use_cache=True,
+                    logits_to_keep=1,
                     return_dict=True,
                 )
 
@@ -470,6 +516,7 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
                             inputs_embeds=negative_inputs_embeds,
                             attention_mask=negative_attention_mask,
                             use_cache=True,
+                            logits_to_keep=1,
                             return_dict=True,
                         )
                     else:
@@ -478,6 +525,7 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
                             attention_mask=negative_attention_mask,
                             past_key_values=negative_past_key_values,
                             use_cache=True,
+                            logits_to_keep=1,
                             return_dict=True,
                         )
                     negative_past_key_values = neg_outputs.past_key_values

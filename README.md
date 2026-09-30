@@ -210,6 +210,35 @@ uv run python start.py generate "Premium quality speech" --model kugelaudio/kuge
 uv run python start.py verify audio.wav
 ```
 
+### GPU and quantization
+
+No build step is needed. `uv sync` (or the first `uv run`) installs everything, including the CUDA 12.8 build of PyTorch on Windows and Linux aarch64 (needs a recent NVIDIA driver) and `bitsandbytes`. After that, just run the project. It uses CUDA automatically and loads the language model in 4-bit (NF4) fully on the GPU, which fits an 8 GB card (~6.5 GB used). The diffusion head, acoustic decoder and embeddings stay in bf16.
+
+```bash
+uv run python start.py                                     # web UI, 4-bit on GPU
+uv run python start.py generate "Hello!" -o out.wav        # 4-bit on GPU (default)
+uv run python start.py generate "Hello!" --quantize 8bit
+uv run python start.py generate "Hello!" --quantize none   # bf16, needs ~16 GB VRAM
+uv run python start.py ui --quantize 4bit
+```
+
+Startup prints `Quantization: 4bit`; the UI logs `Loading model ... on cuda (quantization: 4bit)`.
+
+Verify CUDA is active:
+
+```bash
+uv run python -c "import torch; print(torch.cuda.is_available())"
+```
+
+Notes:
+
+- Use `uv run` (or activate `.venv`). A plain `python` outside the project environment has no torch installed.
+- Don't `pip install torch` over the environment; that replaces the CUDA build with a CPU one. `uv sync` keeps the CUDA build.
+- Loading takes about 30 s. In the UI the model loads on the first request; later requests are fast.
+- Quantization needs CUDA. Without it the model loads unquantized on the CPU, with a warning.
+- On Windows the watermark step runs without `torch.compile` (no MSVC compiler needed).
+- If output is piped on a cp1252 console the emoji prints can raise `UnicodeEncodeError`. Set `PYTHONUTF8=1` (PowerShell: `$env:PYTHONUTF8=1`).
+
 ### Python API
 
 ```python
